@@ -3,7 +3,7 @@ import random
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Optional
+from typing import Literal, Optional
 
 import gymnasium as gym
 import h5py
@@ -20,6 +20,7 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.sampler import BatchSampler, RandomSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+from transformers import AutoModel
 
 from behavior_cloning.evaluate import evaluate
 from behavior_cloning.make_env import make_eval_envs
@@ -46,7 +47,7 @@ class Args:
 
     env_id: str = "PegInsertionSide-v0"
     """the id of the environment"""
-    demo_path: str = "data/ms2_official_demos/rigid_body/PegInsertionSide-v0/trajectory.state.pd_ee_delta_pose.h5"
+    demo_path: str = None
     """the path of demo dataset (pkl or h5)"""
     num_demos: Optional[int] = None
     """number of trajectories to load from the demo dataset"""
@@ -83,6 +84,9 @@ class Args:
     """the number of workers to use for loading the training data in the torch dataloader"""
     control_mode: str = "pd_joint_delta_pos"
     """the control mode to use for the evaluation environments. Must match the control mode of the demonstration dataset."""
+    actor: Literal["theia", "plain"] = "plain"
+    freeze_theia: bool = True
+    obs_mode: Literal["rgbd", "rgb"] = "rgbd"
 
     # additional tags/configs for logging purposes to wandb and shared comparisons with other algorithms
     demo_type: Optional[str] = None
@@ -210,7 +214,10 @@ class ManiSkillDataset(Dataset):
         )
         depth = torch.from_numpy(self.depth[idx]).float().to(device=self.device)
         rgb = torch.from_numpy(self.rgb[idx]).float().to(device=self.device)
-        out["rgbd"] = torch.cat([rgb, depth], dim=-1)
+        if args.obs_mode == "rgbd":
+            out["rgbd"] = torch.cat([rgb, depth], dim=-1)
+        else:
+            out["rgb"] = rgb
         out["state"] = torch.from_numpy(self.states[idx]).float().to(device=self.device)
         return out
 
@@ -311,7 +318,9 @@ class Actor(nn.Module):
         )
         self.get_eval_action = self.get_action = self.forward
 
-    def forward(self, rgbd, state):
+    def forward(self, batch):
+        rgbd = batch["rgbd"]
+        state = batch["state"]
         img = rgbd.permute(0, 3, 1, 2)  # (B, C, H, W)
         feature = self.encoder(img)
         x = torch.cat([feature, state], dim=1)
@@ -328,13 +337,62 @@ def save_ckpt(run_name, tag):
     )
 
 
+########################################################
+## Theia
+########################################################
+class TheiaCNN(nn.Module):
+    def __init__(self, input_channels):
+        super().__init__()
+
+        self.conv1 = nn.Conv2d(input_channels, 256, kernel_size=4, stride=2, padding=1)
+        self.conv2 = nn.Conv2d(256, 256, kernel_size=3, stride=2)
+        self.conv3 = nn.Conv2d(256, 256, kernel_size=3, stride=1)
+
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        return x
+
+
+class TheiaActor(nn.Module):
+    def __init__(self, state_dim: int = 29, action_dim: int = 8):
+        super().__init__()
+        self.theia = AutoModel.from_pretrained(
+            "theaiinstitute/theia-tiny-patch16-224-cddsv", trust_remote_code=True
+        )
+        self.policy_head_cnn = TheiaCNN(input_channels=192)
+        self.policy_head_mlp = make_mlp(
+            256 + state_dim, [256, 256, action_dim], last_act=False
+        )
+        if args.freeze_theia:
+            for param in self.theia.parameters():
+                param.requires_grad = False
+
+    def forward(self, x):
+        rgb = x["rgb"]
+        state = x["state"]
+        feature = self.theia.forward_feature(rgb)  # B, 196, 192
+        feature = feature.permute(0, 2, 1)  # B, 192, 196
+        feature = feature.reshape(*feature.shape[:2], 14, 14)  # B, 192, 14, 14
+        tmp = self.policy_head_cnn(feature)  # B, 256, 1, 1
+        tmp = tmp.flatten(1)  # B, 256
+        action = self.policy_head_mlp(torch.cat([tmp, state], dim=1))  # B, action_dim
+        return action
+
+
+class FlattenRGBObservationWrapper(FlattenRGBDObservationWrapper):
+    def __init__(self, env, rgb=True, depth=False, state=True):
+        super().__init__(env, rgb, depth, state)
+
+
 if __name__ == "__main__":
     args = tyro.cli(Args)
 
     if args.exp_name is None:
         args.exp_name = os.path.basename(__file__)[: -len(".py")]
         time_str = time.strftime("%Y%m%d_%H%M%S", time.localtime())
-        run_name = f"{args.env_id}_{args.exp_name}_{args.lr:.0e}_{args.seed}_{time_str}"
+        run_name = f"{args.env_id}_bc_{args.obs_mode}_{args.actor}_{args.lr:.0e}_{args.seed}_{time_str}"
     else:
         run_name = args.exp_name
 
@@ -366,18 +424,23 @@ if __name__ == "__main__":
     env_kwargs = dict(
         control_mode=args.control_mode,
         reward_mode="sparse",
-        obs_mode="rgbd",
+        obs_mode=args.obs_mode,
         render_mode="all",
     )
     if args.max_episode_steps is not None:
         env_kwargs["max_episode_steps"] = args.max_episode_steps
+
+    if args.obs_mode == "rgbd":
+        wrappers = [FlattenRGBDObservationWrapper]
+    else:
+        wrappers = [FlattenRGBObservationWrapper]
     envs = make_eval_envs(
         args.env_id,
         args.num_eval_envs,
         args.sim_backend,
         env_kwargs,
         video_dir=f"runs/{run_name}/videos" if args.capture_video else None,
-        wrappers=[FlattenRGBDObservationWrapper],
+        wrappers=wrappers,
     )
 
     if args.track:
@@ -412,20 +475,25 @@ if __name__ == "__main__":
         device=device,
         load_count=args.num_demos,
     )
-    print('Length of dataset:', len(ds))  # fixed: 78048
+    print("Length of dataset:", len(ds))  # fixed: 78048
 
     obs, _ = envs.reset(seed=args.seed)
 
     sampler = RandomSampler(ds)
     batch_sampler = BatchSampler(sampler, args.batch_size, drop_last=True)
-    print('Length of batch_sampler:', len(batch_sampler))  # 78048 / args.batch_size
+    print("Length of batch_sampler:", len(batch_sampler))  # 78048 / args.batch_size
     iter_sampler = IterationBasedBatchSampler(batch_sampler, args.total_iters)
-    print('Length of iter_sampler:', len(iter_sampler))  # args.total_iters
+    print("Length of iter_sampler:", len(iter_sampler))  # args.total_iters
     data_loader = DataLoader(ds, batch_sampler=iter_sampler, num_workers=0)
-    print('Length of data_loader:', len(data_loader))  # args.total_iters
-    actor = Actor(ds.states.shape[1], envs.single_action_space.shape[0]).to(
-        device=device
-    )
+    print("Length of data_loader:", len(data_loader))  # args.total_iters
+
+    state_dim = ds.states.shape[1]
+    action_dim = envs.single_action_space.shape[0]
+    print(f"state_dim: {state_dim}, action_dim: {action_dim}")
+    if args.actor == "theia":
+        actor = TheiaActor(state_dim, action_dim).to(device=device)
+    else:
+        actor = Actor(state_dim, action_dim).to(device=device)
 
     optimizer = optim.Adam(actor.parameters(), lr=args.lr)
     best_eval_metrics = defaultdict(float)
@@ -434,7 +502,7 @@ if __name__ == "__main__":
         log_dict = {}
 
         optimizer.zero_grad()
-        preds = actor(batch["rgbd"], batch["state"])
+        preds = actor(batch)
         loss = F.mse_loss(preds, batch["action"])
         loss.backward()
         optimizer.step()
@@ -448,15 +516,20 @@ if __name__ == "__main__":
 
         if iteration % args.eval_freq == 0:
             actor.eval()
-            norm_tensor = torch.Tensor([255.0, 255.0, 255.0, 1024.0]).to(device)
 
             def sample_fn(obs):
-                if isinstance(obs["rgbd"], np.ndarray):
+                if args.obs_mode == "rgbd":
+                    norm_tensor = torch.Tensor([255.0, 255.0, 255.0, 1024.0]).to(device)
+                else:
+                    norm_tensor = torch.Tensor([255.0]).to(device)
+                key = "rgbd" if args.obs_mode == "rgbd" else "rgb"
+
+                if isinstance(obs[key], np.ndarray):
                     for k, v in obs.items():
                         obs[k] = torch.from_numpy(v).float().to(device)
 
-                obs["rgbd"] = torch.div(obs["rgbd"], norm_tensor)
-                action = actor(obs["rgbd"], obs["state"])
+                obs[key] = torch.div(obs[key], norm_tensor)
+                action = actor(obs)
                 if args.sim_backend == "cpu":
                     action = action.cpu().numpy()
                 return action
