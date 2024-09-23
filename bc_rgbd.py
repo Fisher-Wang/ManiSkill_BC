@@ -52,7 +52,7 @@ class Args:
     """number of trajectories to load from the demo dataset"""
     total_iters: int = 1_000_000
     """total timesteps of the experiment"""
-    batch_size: int = 1024
+    batch_size: int = 512
     """the batch size of sample from the replay memory"""
 
     # Behavior cloning specific arguments
